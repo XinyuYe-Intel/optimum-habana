@@ -1,0 +1,28 @@
+python3 run_qlora_clm.py \
+    --model_name_or_path facebook/opt-125m \
+    --dataset_name tatsu-lab/alpaca \
+    --bf16 True \
+    --output_dir ./model_lora_opt \
+    --num_train_epochs 3 \
+    --per_device_train_batch_size 16 \
+    --eval_strategy "no" \
+    --save_strategy "no" \
+    --learning_rate 1e-4 \
+    --warmup_ratio  0.03 \
+    --lr_scheduler_type "constant" \
+    --max_grad_norm  0.3 \
+    --logging_steps 1 \
+    --do_train \
+    --do_eval \
+    --use_habana \
+    --use_lazy_mode \
+    --throughput_warmup_steps 3 \
+    --lora_rank=8 \
+    --lora_alpha=16 \
+    --lora_dropout=0.05 \
+    --lora_target_modules "q_proj" "v_proj" \
+    --dataset_concatenation \
+    --max_seq_length 512 \
+    --low_cpu_mem_usage True \
+    --validation_split_percentage 4 \
+    --adam_epsilon 1e-08
