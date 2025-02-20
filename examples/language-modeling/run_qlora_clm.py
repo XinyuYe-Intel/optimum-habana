@@ -72,6 +72,82 @@ logger = logging.getLogger(__name__)
 # Will error if the minimal version of Optimum Habana is not installed. Remove at your own risks.
 check_optimum_habana_min_version("1.16.0.dev0")
 
+class testmodel(torch.nn.Module):
+    def __init__(self, embed, mid, head, config, generation_config):
+        super().__init__()
+        self.embed = embed
+        self.v_proj = mid
+        self.head = head
+        self.config = config
+        self.generation_config = generation_config
+    
+    def forward(self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        token_idx: Optional[torch.Tensor] = None,
+    ):
+        outputs = self.v_proj(self.embed(input_ids))
+        logits = self.head(outputs).contiguous()
+
+        loss = None
+        if labels is not None:
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(logits.device)
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = torch.nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+
+        if not return_dict:
+            output = (logits,)
+            return (loss,) + output if loss is not None else output
+
+        return {'loss': loss, "logits":logits}
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, token_idx=None, inputs_embeds=None, **kwargs
+    ):
+        if past_key_values is not None:
+            if token_idx is not None:
+                idx = token_idx + kwargs.get("inputs_embeds_offset", 0) - 1
+                input_ids = torch.index_select(input_ids, 1, idx)
+            else:
+                past_length = past_key_values[0][0].shape[2]
+
+                # Some generation methods already pass only the last input ID
+                if input_ids.shape[1] > past_length:
+                    remove_prefix_length = past_length
+                else:
+                    # Default to old behavior: keep only final ID
+                    remove_prefix_length = input_ids.shape[1] - 1
+
+                input_ids = input_ids[:, remove_prefix_length:]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+                "token_idx": token_idx,
+            }
+        )
+        return model_inputs
 
 @dataclass
 class ModelArguments:
@@ -697,6 +773,7 @@ def main():
             token=model_args.token,
         )
         model = replace_linear(model, Linear4bit, copy_weights=True)
+        model = testmodel(model.model.decoder.embed_tokens, model.model.decoder.layers[0].self_attn.v_proj, model.lm_head, model.config, model.generation_config)
     else:
         raise ValueError("Must provide model_name_or_path to load a pretrained CausalLM model.")
 
