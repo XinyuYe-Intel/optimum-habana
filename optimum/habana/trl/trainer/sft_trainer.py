@@ -1,4 +1,4 @@
-# Copyright 2023 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,56 +11,111 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import dataclasses
-import importlib.metadata
-import inspect
-from collections.abc import Mapping
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import datasets
+import dataclasses
+import os
+import warnings
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, Union
+
 import numpy as np
 import torch
 import torch.nn as nn
+import transformers
 from accelerate import PartialState
-from datasets import Dataset
+from datasets import Dataset, IterableDataset
 from packaging import version
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    BaseImageProcessor,
     DataCollator,
-    DataCollatorForLanguageModeling,
+    DataCollatorWithFlattening,
+    FeatureExtractionMixin,
     PreTrainedModel,
     PreTrainedTokenizerBase,
+    ProcessorMixin,
+    TrainingArguments,
+    is_wandb_available,
 )
-from transformers.data.data_collator import pad_without_fast_tokenizer_warning
+from transformers.data.data_collator import DataCollatorForLanguageModeling as TransformersDataCollatorForLanguageModeling
+from transformers.data.data_collator import DataCollatorMixin, pad_without_fast_tokenizer_warning
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalPrediction
+from transformers.utils import is_peft_available
 from trl import SFTTrainer
-from trl.extras.dataset_formatting import get_formatting_func_from_dataset
+from trl.data_utils import (
+    apply_chat_template,
+    is_conversational,
+    maybe_convert_to_chatml,
+    pack_dataset,
+    truncate_dataset,
+)
+from trl.trainer.utils import (
+    ConstantLengthDataset,
+    generate_model_card,
+    get_comet_experiment_url,
+    pad,
+    peft_module_casting_to_bf16,
+)
 
 from ... import GaudiConfig, GaudiTrainer
 from ...utils import warn0
 from .sft_config import GaudiSFTConfig
 
 
-trl_version = importlib.metadata.version("trl")
-if version.parse(trl_version) < version.parse("0.17.0"):
-    from trl.import_utils import is_peft_available
-    from trl.trainer.utils import (
-        ConstantLengthDataset,
-        DataCollatorForCompletionOnlyLM,
-        RichProgressCallback,
-    )
-else:
-    from transformers.utils import is_peft_available
-    from trl.trainer.callbacks import RichProgressCallback
-    from trl.trainer.utils import ConstantLengthDataset, DataCollatorForCompletionOnlyLM
-
 if is_peft_available():
+    import peft
     from peft import PeftConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 
+if is_wandb_available():
+    import wandb
 
-class BucketedDataCollatorForLanguageModeling(DataCollatorForLanguageModeling):
+
+@dataclass
+class DataCollatorForLanguageModeling(DataCollatorMixin):
+    """
+    Data collator used for language modeling data. Inputs are dynamically padded to the maximum length of a batch if
+    they are not all of the same length.
+
+    Args:
+        pad_token_id (`int`):
+            Token ID to use for padding.
+        completion_only_loss (`bool`, *optional*, defaults to `True`):
+            When the input contains a completion mask (`completion_mask`), the labels are set to -100 for the tokens
+            that are not in the completion.
+        return_tensors (`str`, *optional*, defaults to `"pt"`):
+            Type of Tensor to return. Only `"pt"` is currently supported.
+    """
+
+    pad_token_id: int
+    completion_only_loss: bool = True
+    return_tensors: str = "pt"
+
+    def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
+        # Convert to tensor
+        input_ids = [torch.tensor(example["input_ids"]) for example in examples]
+        attention_mask = [torch.ones_like(ids) for ids in input_ids]
+        labels = [torch.tensor(example["input_ids"]) for example in examples]
+        if self.completion_only_loss and "completion_mask" in examples[0]:
+            completion_mask = [torch.tensor(example["completion_mask"]) for example in examples]
+
+        # Pad
+        output = {}
+        output["input_ids"] = pad(input_ids, padding_value=self.pad_token_id, padding_side="right")
+        output["attention_mask"] = pad(attention_mask, padding_value=0, padding_side="right")
+        output["labels"] = pad(labels, padding_value=-100, padding_side="right")
+        if self.completion_only_loss and "completion_mask" in examples[0]:
+            completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
+            output["labels"][completion_mask == 0] = -100  # mask everything that is not in the completion
+
+        return output
+
+
+class BucketedDataCollatorForLanguageModeling(TransformersDataCollatorForLanguageModeling):
+    """Gaudi-specific data collator that uses bucketing for more efficient padding."""
+
     def _get_bucketed_len(self, examples):
         max_sentence_len = max([len(k["input_ids"]) for k in examples])
         if max_sentence_len > self.buckets[-1]:
@@ -72,7 +127,9 @@ class BucketedDataCollatorForLanguageModeling(DataCollatorForLanguageModeling):
 
     # copied from https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/data/data_collator.py#L758
     # change is pad_to_multiple_of=self.pad_to_multiple_of -> pad_to_multiple_of=bucketed_len
-    def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+    def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
+        from collections.abc import Mapping
+
         # Handle dict or lists with proper padding and conversion to tensor.
         if isinstance(examples[0], Mapping):
             bucketed_len = self._get_bucketed_len(examples)
@@ -80,11 +137,10 @@ class BucketedDataCollatorForLanguageModeling(DataCollatorForLanguageModeling):
                 self.tokenizer,
                 examples,
                 return_tensors="pt",
-                pad_to_multiple_of=bucketed_len,  # self.pad_to_multiple_of
+                pad_to_multiple_of=bucketed_len,
             )
         else:
             assert False, "This path has not been implemented/tested yet"
-            # https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/data/data_collator.py#L765
 
         # If special token mask has been preprocessed, pop it from the dict.
         special_tokens_mask = batch.pop("special_tokens_mask", None)
@@ -101,336 +157,195 @@ class BucketedDataCollatorForLanguageModeling(DataCollatorForLanguageModeling):
 
 
 class GaudiSFTTrainer(SFTTrainer, GaudiTrainer):
+    """
+    Gaudi-compatible Supervised Fine-Tuning (SFT) Trainer.
+
+    Adapted from https://github.com/huggingface/trl/blob/cd6b3de/trl/trainer/sft_trainer.py
+    Key differences from upstream SFTTrainer:
+    - Uses `GaudiTrainer` as base instead of `Trainer`
+    - Accepts `gaudi_config` parameter for Gaudi hardware optimizations
+    - Supports bucketing via `num_buckets` for Gaudi hardware efficiency
+    - Supports `pad_max` for static shapes on Gaudi (configured via `GaudiSFTConfig`)
+    - Uses `GaudiSFTConfig` instead of `SFTConfig`
+    """
+
+    _tag_names = ["trl", "sft"]
+
     def __init__(
         self,
-        model: Union[PreTrainedModel, nn.Module, str] = None,
+        model: Union[str, nn.Module, PreTrainedModel] = None,
         args: Optional[GaudiSFTConfig] = None,
         gaudi_config: GaudiConfig = None,
         data_collator: Optional[DataCollator] = None,
-        train_dataset: Optional[Dataset] = None,
-        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
-        tokenizer: Optional[PreTrainedTokenizerBase] = None,
-        model_init: Optional[Callable[[], PreTrainedModel]] = None,
-        compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None,
-        callbacks: Optional[List[TrainerCallback]] = None,
-        optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
+        train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
+        eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
+        processing_class: Optional[
+            Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
+        ] = None,
+        compute_loss_func: Optional[Callable] = None,
+        compute_metrics: Optional[Callable[[EvalPrediction], dict]] = None,
+        callbacks: Optional[list[TrainerCallback]] = None,
+        optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (
+            None,
+            None,
+        ),
+        optimizer_cls_and_kwargs: Optional[tuple[type[torch.optim.Optimizer], dict[str, Any]]] = None,
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         peft_config: Optional["PeftConfig"] = None,
-        dataset_text_field: Optional[str] = None,
-        packing: Optional[bool] = False,
-        formatting_func: Optional[Callable] = None,
-        max_seq_length: Optional[int] = None,
-        pad_max: Optional[bool] = None,
-        infinite: Optional[bool] = None,
-        num_of_sequences: Optional[int] = 1024,
-        chars_per_token: Optional[float] = 3.6,
-        dataset_num_proc: Optional[int] = None,
-        dataset_batch_size: int = 1000,
-        neftune_noise_alpha: Optional[float] = None,
-        model_init_kwargs: Optional[Dict] = None,
-        dataset_kwargs: Optional[Dict] = None,
-        eval_packing: Optional[bool] = None,
+        formatting_func: Optional[Union[Callable[[dict], str], Callable[[dict], list[str]]]] = None,
         num_buckets: Optional[int] = -1,
     ):
         """
-        Copied from SFTTrainer.__init__: https://github.com/huggingface/trl/blob/v0.9.6/trl/trainer/sft_trainer.py#L116
-        The only differences are:
-        - add new args gaudi_config
-        - use GaudiTrainer instead of Trainer
-        - cast peft model to bf16.
-        - add pad_max for static shape
-        - num_buckets: Number of buckets. > 0 means apply bucketing, <= 0  means no bucketing
+        Initialize GaudiSFTTrainer.
+
+        Args:
+            model: Model to train. Can be a string (model path) or a PreTrainedModel.
+            args: GaudiSFTConfig with training configuration.
+            gaudi_config: Gaudi-specific configuration for hardware optimizations.
+            data_collator: Custom data collator.
+            train_dataset: Training dataset.
+            eval_dataset: Evaluation dataset.
+            processing_class: Tokenizer or processor. If None, loaded from model config.
+            compute_loss_func: Custom loss function.
+            compute_metrics: Custom metrics function.
+            callbacks: List of trainer callbacks.
+            optimizers: Optimizer and scheduler tuple.
+            optimizer_cls_and_kwargs: Optimizer class and kwargs (requires transformers>=4.47.0).
+            preprocess_logits_for_metrics: Preprocess logits before metrics computation.
+            peft_config: PEFT configuration for parameter-efficient fine-tuning.
+            formatting_func: Function to format dataset examples.
+            num_buckets: Number of buckets for bucketed data collation (Gaudi-specific).
+                > 0 enables bucketing, <= 0 disables it.
         """
         if num_buckets > 0:
             assert data_collator is None, (
-                "For bucketing (num_buckets > 0), we only support data_collator=None (later it becomes DataCollatorForLanguageModeling)"
+                "For bucketing (num_buckets > 0), we only support data_collator=None "
+                "(later it becomes BucketedDataCollatorForLanguageModeling)"
             )
-        state = PartialState()
+
+        # Args
+        model_id = model if isinstance(model, str) else getattr(getattr(model, "config", None), "_name_or_path", "")
         if args is None:
-            output_dir = "tmp_trainer"
-            warn0(f"No `SFTConfig` passed, using `output_dir={output_dir}`.", state=state)
-            args = GaudiSFTConfig(output_dir=output_dir)
-        elif args is not None and args.__class__.__name__ == "TrainingArguments":
-            args_as_dict = args.to_dict()
-            # Manually copy token values as TrainingArguments.to_dict() redacts them
-            args_as_dict.update({k: getattr(args, k) for k in args_as_dict.keys() if k.endswith("_token")})
-            args = GaudiSFTConfig(**args_as_dict)
+            model_name = model_id.split("/")[-1] if model_id else "model"
+            warn0(f"No `GaudiSFTConfig` passed, using `output_dir={model_name}-SFT`.")
+            args = GaudiSFTConfig(f"{model_name}-SFT")
+        elif isinstance(args, TrainingArguments) and not isinstance(args, GaudiSFTConfig):
+            dict_args = args.to_dict()
+            dict_args["hub_token"] = args.hub_token  # to_dict hides the hub_token
+            dict_args.pop("push_to_hub_token", None)
+            args = GaudiSFTConfig(**dict_args)
 
-        if model_init_kwargs is not None:
+        # Handle the tokenizer / processing_class
+        if processing_class is None:
+            processing_class = AutoTokenizer.from_pretrained(model_id)
+            if getattr(processing_class, "pad_token", None) is None:
+                processing_class.pad_token = processing_class.eos_token
+
+        if args.eos_token is not None:
+            eos_token = args.eos_token
+            eos_token_id = processing_class.convert_tokens_to_ids(eos_token)
+            if eos_token_id is None:
+                raise ValueError(
+                    f"The specified `eos_token` ('{eos_token}') is not found in the vocabulary of the given "
+                    f"`processing_class` ({processing_class.__class__.__name__}). Ensure that the `eos_token` exists "
+                    "in the vocabulary before using it as an EOS token."
+                )
+            processing_class.eos_token_id = eos_token_id
+
+        # Model
+        if args.model_init_kwargs is not None and not isinstance(model, str):
             warn0(
-                "You passed `model_init_kwargs` to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                state=state,
+                "You passed model_init_kwargs to the `GaudiSFTConfig`, but your model is already instantiated. "
+                "The `model_init_kwargs` will be ignored."
             )
-            args.model_init_kwargs = model_init_kwargs
-        if getattr(args, "model_init_kwargs", None) is None:
-            model_init_kwargs = {}
-        elif not isinstance(model, str):
-            raise ValueError("You passed model_init_kwargs to the SFTConfig, but your model is already instantiated.")
-        else:
-            model_init_kwargs = args.model_init_kwargs
-
-            torch_dtype = model_init_kwargs["torch_dtype"]
-            if torch_dtype is not None:
-                # Convert to `torch.dtype` if an str is passed
-                if isinstance(torch_dtype, str) and torch_dtype != "auto":
-                    torch_dtype = getattr(torch, torch_dtype)
-
-                if torch_dtype != "auto" and not isinstance(torch_dtype, torch.dtype):
-                    raise ValueError(
-                        f"Invalid `torch_dtype` passed to the SFTConfig. Expected a string with either `torch.dtype` or 'auto', but got {torch_dtype}."
-                    )
-
-            model_init_kwargs["torch_dtype"] = torch_dtype
-
-        if infinite is not None:
-            warn0(
-                "The `infinite` argument is deprecated and will be removed in a future version of TRL. Use `TrainingArguments.max_steps` or `TrainingArguments.num_train_epochs` instead to control training length.",
-                state=state,
-            )
-
         if isinstance(model, str):
-            warn0(
-                "You passed a model_id to the SFTTrainer. This will automatically create an "
-                "`AutoModelForCausalLM` or a `PeftModel` (if you passed a `peft_config`) for you.",
-                state=state,
-            )
-            model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+            model = self._create_model_from_path(model, args)
 
-        if packing:
-            warn0(
-                "You passed a `packing` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                state=state,
-            )
-            args.packing = packing
-        if eval_packing is not None:
-            warn0(
-                "You passed a `eval_packing` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                state=state,
-            )
-            args.eval_packing = eval_packing
+        # PEFT configuration and model wrapping
+        if peft_config is not None:
+            model = self._prepare_peft_model(model, peft_config, args)
 
-        if args.packing and data_collator is not None and isinstance(data_collator, DataCollatorForCompletionOnlyLM):
-            raise ValueError(
-                "You passed a `DataCollatorForCompletionOnlyLM` to the SFTTrainer. This is not compatible with the `packing` argument."
-            )
-
-        if is_peft_available() and peft_config is not None:
-            if not isinstance(peft_config, PeftConfig):
-                raise ValueError(
-                    "If you want to use the PeftModel, you need to pass a PeftConfig object to the SFTTrainer."
-                    f" and you passed a {type(peft_config)}."
+        # Data collator
+        if args.padding_free:
+            if data_collator is not None:
+                raise ValueError("Passing a custom data collator is not supported when using padding-free.")
+            if args.packing:
+                warnings.warn(
+                    "You are passing `packing=True` and `padding_free=True` which is not recommended. Please refer "
+                    "to the documentation to understand why this is not recommended."
                 )
-
-            if not isinstance(model, PeftModel):
-                _support_gc_kwargs = hasattr(
-                    args, "gradient_checkpointing_kwargs"
-                ) and "gradient_checkpointing_kwargs" in list(
-                    inspect.signature(prepare_model_for_kbit_training).parameters
+            if model.config._attn_implementation != "flash_attention_2":
+                warnings.warn(
+                    "Padding-free training is enabled, but the attention implementation is not set to "
+                    "'flash_attention_2'. Padding-free training flattens batches into a single sequence, and "
+                    "'flash_attention_2' is the only known attention mechanism that reliably supports this."
                 )
-                gradient_checkpointing_kwargs = getattr(args, "gradient_checkpointing_kwargs", None) or {}
-                is_sharded_qlora = False
-                # Below is to support QLoRA + FSDP / DS-Zero3 - one should never call
-                # peft_module_casting_to_bf16 or prepare_model_for_kbit_training when doing
-                # QLoRA + FSDP / DS-Zero3
-                if getattr(model, "is_loaded_in_4bit", False):
-                    for _, param in model.named_parameters():
-                        if param.__class__.__name__ == "Params4bit":
-                            is_sharded_qlora = param.data.device.type == "cpu"
-                            break
-                if getattr(model, "is_loaded_in_8bit", False) or (
-                    getattr(model, "is_loaded_in_4bit", False) and not is_sharded_qlora
-                ):
-                    prepare_model_kwargs = {
-                        "use_gradient_checkpointing": getattr(args, "gradient_checkpointing", False)
-                    }
-
-                    if _support_gc_kwargs:
-                        prepare_model_kwargs["gradient_checkpointing_kwargs"] = gradient_checkpointing_kwargs
-
-                    model = prepare_model_for_kbit_training(model, **prepare_model_kwargs)
-
-                    args = dataclasses.replace(args, gradient_checkpointing=False)
-                elif getattr(args, "gradient_checkpointing", False) and (
-                    "use_reentrant" not in gradient_checkpointing_kwargs
-                    or gradient_checkpointing_kwargs["use_reentrant"]
-                ):
-                    # For backward compatibility with older versions of transformers
-                    if hasattr(model, "enable_input_require_grads"):
-                        model.enable_input_require_grads()
-                    else:
-
-                        def make_inputs_require_grad(module, input, output):
-                            output.requires_grad_(True)
-
-                        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
-                if (
-                    "autocast_adapter_dtype" in list(inspect.signature(get_peft_model).parameters)
-                    and getattr(model, "is_loaded_in_4bit", False)
-                    and is_sharded_qlora
-                ):
-                    model = get_peft_model(model, peft_config, autocast_adapter_dtype=False)
-                else:
-                    model = get_peft_model(model, peft_config)
-                if args.bf16 and getattr(model, "is_loaded_in_4bit", False) and not is_sharded_qlora:
-                    model = model.to(torch.bfloat16)
-
-        if tokenizer is None:
-            tokenizer = AutoTokenizer.from_pretrained(model.config._name_or_path)
-            if getattr(tokenizer, "pad_token", None) is None:
-                tokenizer.pad_token = tokenizer.eos_token
-
-        if max_seq_length is not None:
-            warn0(
-                "You passed a `max_seq_length` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                state=state,
-            )
-            args.max_seq_length = max_seq_length
-
-        if pad_max is not None:
-            warn0(
-                "You passed a `pad_max` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                state=state,
-            )
-            args.pad_max = pad_max
-
-        if args.max_seq_length is None:
-            # to overcome some issues with broken tokenizers
-            max_seq_length = min(tokenizer.model_max_length, 1024)
-
-            warn0(
-                f"You didn't pass a `max_seq_length` argument to the SFTTrainer, this will default to {max_seq_length}",
-                state=state,
-            )
-
-        if dataset_num_proc is not None:
-            warn0(
-                "You passed a `dataset_num_proc` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                state=state,
-            )
-            args.dataset_num_proc = dataset_num_proc
-        self.dataset_num_proc = args.dataset_num_proc
-
-        if dataset_batch_size != args.dataset_batch_size:
-            warn0(
-                "You passed a `dataset_batch_size` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                state=state,
-            )
-            args.dataset_batch_size = dataset_batch_size
-        self.dataset_batch_size = args.dataset_batch_size
-
-        self._trainer_supports_neftune = hasattr(args, "neftune_noise_alpha")
-        if neftune_noise_alpha is not None and self._trainer_supports_neftune:
-            args.neftune_noise_alpha = neftune_noise_alpha
-            warn0(
-                "You passed a `neftune_noise_alpha` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                state=state,
-            )
-            # self.neftune_noise_alpha is done at Trainer level
-        elif not self._trainer_supports_neftune:
-            self.neftune_noise_alpha = neftune_noise_alpha
-
-        if dataset_text_field is not None:
-            warn0(
-                "You passed a `dataset_text_field` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                state=state,
-            )
-            args.dataset_text_field = dataset_text_field
-
-        if formatting_func is None and args.dataset_text_field is None:
-            # check if dataset has ChatML format or instruction format and is supported
-            # if not stays #None
-            formatting_func = get_formatting_func_from_dataset(train_dataset, tokenizer)
-            # if a template is detected, we don't need to add special tokens again
-            if formatting_func is not None:
-                if dataset_kwargs is None:
-                    dataset_kwargs = {"add_special_tokens": False}
-                else:
-                    dataset_kwargs["add_special_tokens"] = False
-
-        if not args.packing:
-            # If we aren't skipping data preparation, then a dataset_text_field
-            # or formatting_func must be provided.
-            if (
-                args.dataset_text_field is None
-                and formatting_func is None
-                and dataset_kwargs is not None
-                and "skip_prepare_dataset" in dataset_kwargs
-                and dataset_kwargs["skip_prepare_dataset"]
-            ):
-                raise ValueError(
-                    "You passed `packing=False` to the SFTTrainer/SFTConfig, but you didn't pass a `dataset_text_field` or `formatting_func` argument."
+            if args.per_device_train_batch_size == 1:
+                warnings.warn(
+                    "You are using a per_device_train_batch_size of 1 with padding-free training. Using a batch size "
+                    "of 1 anihilate the benefits of padding-free training. Please consider increasing the batch size "
+                    "to at least 2."
                 )
+            data_collator = DataCollatorWithFlattening()
 
-            if data_collator is None:
-                data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+        if num_buckets <= 0:
+            # Only set completion_only_loss and default data collator when not using bucketing
+            if args.completion_only_loss is None:
+                first_example = next(iter(train_dataset)) if train_dataset is not None else {}
+                self.completion_only_loss = "prompt" in first_example
+            else:
+                self.completion_only_loss = args.completion_only_loss
 
-        if num_of_sequences != args.num_of_sequences:
-            warn0(
-                "You passed a `num_of_sequences` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                state=state,
-            )
-            args.num_of_sequences = num_of_sequences
-
-        if chars_per_token != args.chars_per_token:
-            warn0(
-                "You passed a `chars_per_token` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                state=state,
-            )
-            args.chars_per_token = chars_per_token
-
-        # Pre-process the datasets only once per node. The remaining processes will use the cache.
-        with state.local_main_process_first():
-            if dataset_kwargs is not None:
-                warn0(
-                    "You passed a `dataset_kwargs` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`.",
-                    state=state,
+            if data_collator is None and not args.padding_free:
+                # Get the pad token: if not provided, use the one from the processing class or the eos token
+                pad_token = (
+                    args.pad_token
+                    or getattr(processing_class, "pad_token", None)
+                    or getattr(processing_class, "eos_token", None)
                 )
-                args.dataset_kwargs = dataset_kwargs
-            if args.dataset_kwargs is None:
-                args.dataset_kwargs = {}
+                pad_token_id = processing_class.convert_tokens_to_ids(pad_token) if pad_token else None
+                if pad_token_id is None:
+                    raise ValueError(
+                        f"The specified `pad_token` ('{pad_token}') is not found in the vocabulary of the given "
+                        f"`processing_class` ({processing_class.__class__.__name__}). Ensure that the `pad_token` "
+                        "exists in the vocabulary before using it as a padding token."
+                    )
+                data_collator = DataCollatorForLanguageModeling(pad_token_id, self.completion_only_loss)
+
+        # Dataset
+        preprocess_dataset = args.dataset_kwargs is None or not args.dataset_kwargs.get("skip_prepare_dataset", False)
+        if preprocess_dataset:
             if train_dataset is not None:
                 train_dataset = self._prepare_dataset(
-                    train_dataset,
-                    tokenizer,
-                    args.packing,
-                    args.dataset_text_field,
-                    args.max_seq_length,
-                    formatting_func,
-                    args.num_of_sequences,
-                    args.chars_per_token,
-                    remove_unused_columns=args.remove_unused_columns,
-                    pad_max=args.pad_max,
-                    **args.dataset_kwargs,
+                    train_dataset, processing_class, args, args.packing, formatting_func, "train"
                 )
             if eval_dataset is not None:
-                _multiple = isinstance(eval_dataset, dict)
-                _eval_datasets = eval_dataset if _multiple else {"singleton": eval_dataset}
-
-                eval_packing = args.packing if args.eval_packing is None else args.eval_packing
-
-                for _eval_dataset_name, _eval_dataset in _eval_datasets.items():
-                    _eval_datasets[_eval_dataset_name] = self._prepare_dataset(
-                        _eval_dataset,
-                        tokenizer,
-                        eval_packing,
-                        args.dataset_text_field,
-                        args.max_seq_length,
-                        formatting_func,
-                        args.num_of_sequences,
-                        args.chars_per_token,
-                        remove_unused_columns=args.remove_unused_columns,
-                        **args.dataset_kwargs,
+                packing = args.packing if args.eval_packing is None else args.eval_packing
+                if isinstance(eval_dataset, dict):
+                    eval_dataset = {
+                        key: self._prepare_dataset(dataset, processing_class, args, packing, formatting_func, key)
+                        for key, dataset in eval_dataset.items()
+                    }
+                else:
+                    eval_dataset = self._prepare_dataset(
+                        eval_dataset, processing_class, args, packing, formatting_func, "eval"
                     )
-                if not _multiple:
-                    eval_dataset = _eval_datasets["singleton"]
 
-        if tokenizer.padding_side is not None and tokenizer.padding_side != "right":
-            warn0(
-                "You passed a tokenizer with `padding_side` not equal to `right` to the SFTTrainer. This might lead to some unexpected behaviour due to "
-                "overflow issues when training a model in half-precision. You might consider adding `tokenizer.padding_side = 'right'` to your code.",
-                state=state,
-            )
+        # Initialize metrics tracking
+        self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        self._total_train_tokens = 0
+
+        # Initialize the GaudiTrainer
+        super_init_kwargs = {}
+        if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
+            super_init_kwargs["optimizer_cls_and_kwargs"] = optimizer_cls_and_kwargs
+        else:
+            if optimizer_cls_and_kwargs is not None:
+                warnings.warn(
+                    "The `optimizer_cls_and_kwargs` argument is only available for `transformers>=4.47.0`. "
+                    "The default optimizer will be used. "
+                    "Remove the `optimizer_cls_and_kwargs` or upgrade to `transformers>=4.47.0`."
+                )
 
         GaudiTrainer.__init__(
             self,
@@ -440,12 +355,13 @@ class GaudiSFTTrainer(SFTTrainer, GaudiTrainer):
             data_collator=data_collator,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            processing_class=tokenizer,
-            model_init=model_init,
+            processing_class=processing_class,
+            compute_loss_func=compute_loss_func,
             compute_metrics=compute_metrics,
             callbacks=callbacks,
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+            **super_init_kwargs,
         )
 
         # Add tags for models that have been loaded with the correct transformers version
@@ -454,165 +370,314 @@ class GaudiSFTTrainer(SFTTrainer, GaudiTrainer):
 
         if self.args.max_steps > 0 and args.packing:
             warn0(
-                "You passed `packing=True` to the SFTTrainer/SFTConfig, and you are training your model with `max_steps` strategy. The dataset will be iterated until the `max_steps` are reached.",
+                "You passed `packing=True` to the GaudiSFTTrainer/GaudiSFTConfig, and you are training your model "
+                "with `max_steps` strategy. The dataset will be iterated until the `max_steps` are reached.",
                 state=self.accelerator.state,
             )
             self.train_dataset.infinite = True
         elif self.args.max_steps == -1 and args.packing:
             self.train_dataset.infinite = False
 
+        # Bucketing (Gaudi-specific)
         if num_buckets > 0:
             train_dataloader = self.get_train_dataloader()
             batched_sentence_lengths = [batch["input_ids"].shape[1] for batch in train_dataloader]
             buckets = self._get_buckets(batched_sentence_lengths, num_buckets=num_buckets)
-            self.data_collator = BucketedDataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+            self.data_collator = BucketedDataCollatorForLanguageModeling(tokenizer=processing_class, mlm=False)
             self.data_collator.buckets = buckets
 
-        if any(isinstance(callback, RichProgressCallback) for callback in self.callback_handler.callbacks):
-            for callback in self.callback_handler.callbacks:
-                # Remove the PrinterCallback to avoid duplicated prints in case we passed a `RichProgressCallback`
-                if callback.__class__.__name__ == "PrinterCallback":
-                    self.callback_handler.pop_callback(callback)
+    def _create_model_from_path(self, model_path: str, args: GaudiSFTConfig) -> PreTrainedModel:
+        """Creates a model from a path or model identifier."""
+        model_init_kwargs = args.model_init_kwargs or {}
+        # Handle torch dtype
+        torch_dtype = model_init_kwargs.get("torch_dtype")
+        if isinstance(torch_dtype, torch.dtype) or torch_dtype == "auto" or torch_dtype is None:
+            pass  # torch_dtype is already a torch.dtype or "auto" or None
+        elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
+            torch_dtype = getattr(torch, torch_dtype)
+            model_init_kwargs["torch_dtype"] = torch_dtype
+        else:
+            raise ValueError(
+                "Invalid `torch_dtype` passed to `GaudiSFTConfig`. Expected either 'auto' or a string representing "
+                f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
+            )
+        model = AutoModelForCausalLM.from_pretrained(model_path, **model_init_kwargs)
+        return model
+
+    def _prepare_peft_model(self, model: PreTrainedModel, peft_config: Any, args: GaudiSFTConfig) -> PreTrainedModel:
+        """Prepares a model for PEFT training."""
+        if not is_peft_available():
+            raise ImportError("To use PeftModel, you need to install the `peft` library.")
+
+        if not isinstance(peft_config, PeftConfig):
+            raise ValueError(
+                f"Expected PeftConfig object but got {type(peft_config)}. If you want to use the PeftModel, you need "
+                "to pass a PeftConfig object to the GaudiSFTTrainer."
+            )
+
+        if isinstance(model, PeftModel):
+            return model
+
+        # Handle quantized models (QLoRA)
+        is_qlora = getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False)
+
+        is_sharded_qlora = False
+        if getattr(model, "is_loaded_in_4bit", False):
+            # Check if model is sharded (FSDP/DS-Zero3)
+            for _, param in model.named_parameters():
+                if param.__class__.__name__ == "Params4bit":
+                    is_sharded_qlora = param.data.device.type in {"cpu", "meta"}
+                    break
+
+        # Prepare model for kbit training if needed
+        if is_qlora and not is_sharded_qlora:
+            model = self._prepare_model_for_kbit_training(model, args)
+            # Disable gradient checkpointing as it's handled by prepare_model_for_kbit_training
+            args = dataclasses.replace(args, gradient_checkpointing=False)
+        elif args.gradient_checkpointing:
+            model = self._enable_gradient_checkpointing(model, args)
+
+        # Create PEFT model
+        if (
+            version.parse(peft.__version__) >= version.parse("0.12")  # autocast_adapter_dtype introduced in 0.12
+            and getattr(model, "is_loaded_in_4bit", False)
+            and is_sharded_qlora
+        ):
+            model = get_peft_model(model, peft_config, autocast_adapter_dtype=False)
+        else:
+            model = get_peft_model(model, peft_config)
+
+        # Handle bf16 casting for 4-bit models
+        if args.bf16 and getattr(model, "is_loaded_in_4bit", False) and not is_sharded_qlora:
+            peft_module_casting_to_bf16(model)
+
+        return model
+
+    def _prepare_model_for_kbit_training(self, model: PreTrainedModel, args: GaudiSFTConfig) -> PreTrainedModel:
+        """Prepares a quantized model for kbit training."""
+        prepare_model_kwargs = {
+            "use_gradient_checkpointing": args.gradient_checkpointing,
+            "gradient_checkpointing_kwargs": args.gradient_checkpointing_kwargs or {},
+        }
+        return prepare_model_for_kbit_training(model, **prepare_model_kwargs)
+
+    def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GaudiSFTConfig) -> PreTrainedModel:
+        """Enables gradient checkpointing for the model."""
+        gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
+        use_reentrant = (
+            "use_reentrant" not in gradient_checkpointing_kwargs or gradient_checkpointing_kwargs["use_reentrant"]
+        )
+
+        if use_reentrant:
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+            else:
+
+                def make_inputs_require_grad(module, input, output):
+                    output.requires_grad_(True)
+
+                model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+        return model
 
     def _prepare_dataset(
         self,
-        dataset,
-        tokenizer,
-        packing,
-        dataset_text_field,
-        max_seq_length,
-        formatting_func,
-        num_of_sequences,
-        chars_per_token,
-        remove_unused_columns=True,
-        pad_max=False,
-        append_concat_token=True,
-        add_special_tokens=True,
-        skip_prepare_dataset=False,
-    ):
+        dataset: Union[Dataset, IterableDataset],
+        processing_class: Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin],
+        args: GaudiSFTConfig,
+        packing: bool,
+        formatting_func: Optional[Callable[[dict], str]],
+        dataset_name: str,
+    ) -> Union[Dataset, IterableDataset]:
         """
-        Copied from SFTTrainer._prepare_dataset https://github.com/huggingface/trl/blob/v0.9.6/trl/trainer/sft_trainer.py#L477
-        The only differences are:
-        - add pad_max for static shape
+        Prepares dataset for training/evaluation.
+
+        Adapted from upstream SFTTrainer._prepare_dataset with Gaudi-specific additions:
+        - `pad_max` support: when `args.pad_max` is True, pads sequences to `max_length` during
+          tokenization for static shapes on Gaudi hardware.
         """
-
-        if dataset is None:
-            raise ValueError("The dataset should not be None")
-
-        if skip_prepare_dataset:
+        # Convert the dataset to an IterableDataset if it is a ConstantLengthDataset
+        if isinstance(dataset, ConstantLengthDataset):
             return dataset
 
-        # If the dataset is already preprocessed (tokenized), return as-is. Only works if dataset is
-        # a datasets.Dataset or datasets.IterableDataset -- not for torch Dataset
-        column_names = (
-            dataset.column_names if isinstance(dataset, (datasets.Dataset, datasets.IterableDataset)) else None
-        )
-        if column_names and "input_ids" in column_names:
-            if formatting_func is not None:
-                warn0(
-                    "You passed a dataset that is already processed (contains an `input_ids` field) together with a valid formatting function. Therefore `formatting_func` will be ignored.",
-                    state=self.accelerator.state,
+        # If the dataset is already preprocessed (tokenized), skip the processing steps.
+        column_names = list(next(iter(dataset)).keys())
+        is_processed = "input_ids" in column_names
+
+        # Build the kwargs for the `map` function
+        map_kwargs = {}
+        if isinstance(dataset, Dataset):  # IterableDataset does not support num_proc
+            map_kwargs["num_proc"] = args.dataset_num_proc
+
+        add_special_tokens = True  # default, overridden below based on dataset type
+
+        with PartialState().main_process_first():
+            # Apply the formatting function if any
+            if formatting_func is not None and is_processed:
+                warnings.warn(
+                    "You passed a dataset that is already processed (contains an `input_ids` field) together with a "
+                    "formatting function. Therefore `formatting_func` will be ignored. Either remove the "
+                    "`formatting_func` or pass a dataset that is not already processed.",
+                    UserWarning,
                 )
 
-            return dataset
+            if formatting_func is not None and not is_processed:
+                if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+                    map_kwargs["desc"] = f"Applying formatting function to {dataset_name} dataset"
 
-        # check if torch dataset / dataloader and do nothing
-        # see https://github.com/huggingface/trl/pull/1468 for why datasets.IterableDataset needs a separate check
-        if isinstance(
-            dataset, (torch.utils.data.IterableDataset, torch.utils.data.Dataset, ConstantLengthDataset)
-        ) and not isinstance(dataset, datasets.IterableDataset):
-            return dataset
+                def _func(example):
+                    return {"text": formatting_func(example)}
 
-        if not packing:
-            return self._prepare_non_packed_dataloader(
-                tokenizer,
-                dataset,
-                dataset_text_field,
-                max_seq_length,
-                formatting_func,
-                add_special_tokens,
-                remove_unused_columns,
-                pad_max,
-            )
-
-        else:
-            return self._prepare_packed_dataloader(
-                tokenizer,
-                dataset,
-                dataset_text_field,
-                max_seq_length,
-                num_of_sequences,
-                chars_per_token,
-                formatting_func,
-                append_concat_token,
-                add_special_tokens,
-            )
-
-    def _prepare_non_packed_dataloader(
-        self,
-        tokenizer,
-        dataset,
-        dataset_text_field,
-        max_seq_length,
-        formatting_func=None,
-        add_special_tokens=True,
-        remove_unused_columns=True,
-        pad_max=False,
-    ):
-        """
-        Copied from SFTTrainer._prepare_non_packed_dataloader
-        https://github.com/huggingface/trl/blob/v0.9.6/trl/trainer/sft_trainer.py#L542
-        The only differences are:
-        - add pad_max for static shape
-        """
-
-        use_formatting_func = formatting_func is not None and dataset_text_field is None
-        self._dataset_sanity_checked = False
-
-        # Inspired from: https://huggingface.co/learn/nlp-course/chapter7/6?fw=pt
-        def tokenize(element):
-            outputs = tokenizer(
-                element[dataset_text_field] if not use_formatting_func else formatting_func(element),
-                add_special_tokens=add_special_tokens,
-                truncation=True,
-                padding="max_length" if pad_max else False,
-                max_length=max_seq_length,
-                return_overflowing_tokens=False,
-                return_length=False,
-            )
-
-            if use_formatting_func and not self._dataset_sanity_checked:
-                if not isinstance(formatting_func(element), list):
-                    raise ValueError(
-                        "The `formatting_func` should return a list of processed strings since it can lead to silent bugs."
+                try:
+                    dataset = dataset.map(_func, batched=False, **map_kwargs)
+                except Exception as e:
+                    warnings.warn(
+                        f"Failed to apply the formatting function due to the following error: {e}. This may be "
+                        "because the function is designed for batched input. Please update it to process one example "
+                        "at a time (i.e., accept and return a single example). For now, we will attempt to apply the "
+                        "function in batched mode, but note that batched formatting is deprecated and will be removed "
+                        "in a future version.",
+                        DeprecationWarning,
                     )
+                    dataset = dataset.map(_func, batched=True, **map_kwargs)
+
+            if not is_processed:
+                # Convert the dataset to ChatML if needed
+                if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+                    map_kwargs["desc"] = f"Converting {dataset_name} dataset to ChatML"
+                column_names = next(iter(dataset)).keys()
+                dataset = dataset.map(
+                    maybe_convert_to_chatml,
+                    remove_columns="conversations" if "conversations" in column_names else None,
+                    **map_kwargs,
+                )
+
+                # Apply the chat template if needed
+                first_example = next(iter(dataset))
+                if is_conversational(first_example):
+                    if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+                        map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
+                    column_names = first_example.keys()
+                    dataset = dataset.map(
+                        apply_chat_template,
+                        fn_kwargs={"tokenizer": processing_class},
+                        remove_columns="messages" if "messages" in column_names else None,
+                        **map_kwargs,
+                    )
+                    # Subsequent tokenization won't add special tokens (mostly for bos).
+                    # See https://huggingface.co/blog/qgallouedec/gotchas-in-tokenizer-behavior
+                    add_special_tokens = False
                 else:
-                    self._dataset_sanity_checked = True
+                    # When dataset is not conversational, add EOS token at the end of each example
+                    if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+                        map_kwargs["desc"] = f"Adding EOS to {dataset_name} dataset"
 
-            return {"input_ids": outputs["input_ids"], "attention_mask": outputs["attention_mask"]}
+                    def add_eos(example, eos_token):
+                        if "text" in example and not example["text"].endswith(eos_token):
+                            example["text"] = example["text"] + eos_token
+                        elif "completion" in example and not example["completion"].endswith(eos_token):
+                            example["completion"] = example["completion"] + eos_token
+                        return example
 
-        signature_columns = ["input_ids", "labels", "attention_mask"]
+                    dataset = dataset.map(
+                        add_eos,
+                        fn_kwargs={"eos_token": processing_class.eos_token},
+                        remove_columns="messages" if "messages" in column_names else None,
+                        **map_kwargs,
+                    )
+                    # Subsequent tokenization will add special tokens (mostly for bos).
+                    add_special_tokens = True
 
-        extra_columns = list(set(dataset.column_names) - set(signature_columns))
+                # Tokenize the dataset
+                if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+                    map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
 
-        if not remove_unused_columns and len(extra_columns) > 0:
-            warn0(
-                "You passed `remove_unused_columns=False` on a non-packed dataset. This might create some issues with the default collator and yield to errors. If you want to "
-                f"inspect dataset other columns (in this case {extra_columns}), you can subclass `DataCollatorForLanguageModeling` in case you used the default collator and create your own data collator in order to inspect the unused dataset columns.",
-                state=self.accelerator.state,
-            )
+                # Gaudi-specific: support pad_max for static shape training
+                pad_max = getattr(args, "pad_max", False)
+                max_length = args.max_length
 
-        tokenized_dataset = dataset.map(
-            tokenize,
-            batched=True,
-            remove_columns=dataset.column_names if remove_unused_columns else None,
-            num_proc=self.dataset_num_proc,
-            batch_size=self.dataset_batch_size,
-        )
+                def tokenize(example, processing_class, dataset_text_field, add_special_tokens, pad_max, max_length):
+                    if "prompt" in example:  # prompt-completion case
+                        processed_prompt = processing_class(
+                            text=example["prompt"],
+                            add_special_tokens=add_special_tokens,
+                        )
+                        processed = processing_class(
+                            text=example["prompt"] + example["completion"],
+                            add_special_tokens=add_special_tokens,
+                            truncation=True if max_length else False,
+                            padding="max_length" if pad_max and max_length else False,
+                            max_length=max_length,
+                        )
 
-        return tokenized_dataset
+                        # Check if the tokenized prompt starts with the tokenized prompt+completion
+                        prompt_ids = processed_prompt["input_ids"]
+                        prompt_completion_ids = processed["input_ids"]
+                        if not prompt_completion_ids[: len(prompt_ids)] == prompt_ids:
+                            warnings.warn(
+                                "Mismatch between tokenized prompt and the start of tokenized prompt+completion. "
+                                "This may be due to unexpected tokenizer behavior, whitespace issues, or special "
+                                "token handling."
+                            )
+
+                        # Create a completion mask
+                        completion_mask = [0] * len(prompt_ids) + [1] * (
+                            len(prompt_completion_ids) - len(prompt_ids)
+                        )
+                        processed = {**processed, "completion_mask": completion_mask}
+
+                    else:  # language modeling case
+                        processed = processing_class(
+                            text=example[dataset_text_field],
+                            add_special_tokens=add_special_tokens,
+                            truncation=True if max_length else False,
+                            padding="max_length" if pad_max and max_length else False,
+                            max_length=max_length,
+                        )
+                    return processed
+
+                dataset = dataset.map(
+                    tokenize,
+                    fn_kwargs={
+                        "processing_class": processing_class,
+                        "dataset_text_field": args.dataset_text_field,
+                        "add_special_tokens": add_special_tokens,
+                        "pad_max": pad_max,
+                        "max_length": max_length,
+                    },
+                    **map_kwargs,
+                )
+
+            # Pack or truncate
+            if packing:
+                if args.max_length is None:
+                    raise ValueError("When packing is enabled, `max_length` can't be `None`.")
+                if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+                    map_kwargs["desc"] = f"Packing {dataset_name} dataset"
+                dataset = dataset.select_columns("input_ids")
+                dataset = pack_dataset(dataset, args.max_length, map_kwargs)
+            elif args.max_length is not None and not getattr(args, "pad_max", False):
+                # Only truncate if pad_max is not enabled (pad_max already handles length during tokenization)
+                if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+                    map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
+                dataset = truncate_dataset(dataset, args.max_length, map_kwargs)
+
+            # For Liger kernel, ensure only input_ids is present
+            if getattr(args, "use_liger_kernel", False):
+                dataset = dataset.select_columns("input_ids")
+
+        return dataset
+
+    def _set_signature_columns_if_needed(self):
+        # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
+        # By default, this method sets `self._signature_columns` to the model's expected inputs.
+        # When using `completion_only_loss` we add a "completion_mask" column to the dataset,
+        # so we need to override the default to include "completion_mask" as well.
+        if self._signature_columns is None:
+            self._signature_columns = ["input_ids", "attention_mask", "completion_mask"]
 
     def _get_buckets(self, sentence_lengths, num_buckets):
+        """Compute bucket boundaries from sentence length distribution (Gaudi-specific)."""
         return np.unique(
             np.percentile(
                 sentence_lengths,
@@ -620,3 +685,110 @@ class GaudiSFTTrainer(SFTTrainer, GaudiTrainer):
                 interpolation="lower",
             )[1:]
         )
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        Compute training loss and additionally compute token accuracies.
+        """
+        mode = "eval" if self.control.should_evaluate else "train"
+        (loss, outputs) = super().compute_loss(
+            model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
+        )
+        if mode == "train":
+            if "attention_mask" in inputs:
+                num_tokens_in_batch = self.accelerator.gather_for_metrics(inputs["attention_mask"].sum()).sum().item()
+            elif "position_ids" in inputs:
+                local_num_tokens = torch.tensor(inputs["position_ids"].size(1), device=inputs["position_ids"].device)
+                num_tokens_in_batch = self.accelerator.gather_for_metrics(local_num_tokens).sum().item()
+            else:
+                raise ValueError("Expected 'attention_mask' or 'position_ids' in inputs.")
+            self._total_train_tokens += num_tokens_in_batch
+        self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
+
+        # Compute token accuracy if we have labels and if the model is not using Liger (no logits)
+        if "labels" in inputs and not getattr(self.args, "use_liger_kernel", False):
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = inputs["labels"][..., 1:].contiguous()
+
+            # Get predictions
+            predictions = shift_logits.argmax(dim=-1)
+
+            # Create mask for non-padding tokens (assuming ignore_index is -100)
+            mask = shift_labels != -100
+
+            # Calculate accuracy only on non-padding tokens
+            correct_predictions = (predictions == shift_labels) & mask
+            total_tokens = mask.sum()
+            correct_tokens = correct_predictions.sum()
+
+            # Gather the correct_tokens and total_tokens across all processes
+            correct_tokens = self.accelerator.gather_for_metrics(correct_tokens)
+            total_tokens = self.accelerator.gather_for_metrics(total_tokens)
+
+            # Compute the mean token accuracy and log it
+            total_sum = total_tokens.sum()
+            accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
+            self._metrics[mode]["mean_token_accuracy"].append(accuracy)
+
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        mode = "eval" if self.control.should_evaluate else "train"
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items() if val}
+
+        # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
+        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
+        if mode == "eval":
+            metrics = {f"eval_{key}": val for key, val in metrics.items()}
+
+        logs = {**logs, **metrics}
+        if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
+            super().log(logs, start_time)
+        else:  # transformers<=4.46
+            super().log(logs)
+        self._metrics[mode].clear()
+
+    def create_model_card(
+        self,
+        model_name: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        tags: Union[str, list[str], None] = None,
+    ):
+        """
+        Creates a draft of a model card using the information available to the `Trainer`.
+
+        Args:
+            model_name (`str` or `None`, *optional*, defaults to `None`):
+                Name of the model.
+            dataset_name (`str` or `None`, *optional*, defaults to `None`):
+                Name of the dataset used for training.
+            tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
+                Tags to be associated with the model card.
+        """
+        if not self.is_world_process_zero():
+            return
+
+        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(self.model.config._name_or_path):
+            base_model = self.model.config._name_or_path
+        else:
+            base_model = None
+
+        tags = tags or []
+        if isinstance(tags, str):
+            tags = [tags]
+
+        if hasattr(self.model.config, "unsloth_version"):
+            tags.append("unsloth")
+
+        model_card = generate_model_card(
+            base_model=base_model,
+            model_name=model_name,
+            hub_model_id=self.hub_model_id,
+            dataset_name=dataset_name,
+            tags=tags,
+            wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
+            comet_url=get_comet_experiment_url(),
+            trainer_name="SFT",
+        )
+
+        model_card.save(os.path.join(self.args.output_dir, "README.md"))
