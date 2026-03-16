@@ -1,4 +1,4 @@
-# Copyright 2022 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass
-from typing import Dict, Optional
+
+import warnings
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from ... import GaudiTrainingArguments
 
@@ -20,20 +22,210 @@ from ... import GaudiTrainingArguments
 @dataclass
 class GaudiSFTConfig(GaudiTrainingArguments):
     r"""
-    Initialize GaudiSFTConfig.
-        Adapted from https://github.com/huggingface/trl/blob/v0.9.6/trl/trainer/sft_config.py#L21
-        - inherit from GaudiTrainingArguments
+    Configuration class for the [`GaudiSFTTrainer`].
+
+    Only the parameters specific to SFT training are listed here. For details on other parameters, refer to
+    [`GaudiTrainingArguments`] documentation.
+
+    Adapted from https://github.com/huggingface/trl/blob/cd6b3de/trl/trainer/sft_config.py
+    - inherits from GaudiTrainingArguments instead of TrainingArguments
+    - keeps Gaudi-specific fields: `pad_max`
+
+    Parameters:
+        > Parameters that control the model
+
+        model_init_kwargs (`dict[str, Any]` or `None`, *optional*, defaults to `None`):
+            Keyword arguments for [`~transformers.AutoModelForCausalLM.from_pretrained`], used when the `model`
+            argument of the [`GaudiSFTTrainer`] is provided as a string.
+
+        > Parameters that control the data preprocessing
+
+        dataset_text_field (`str`, *optional*, defaults to `"text"`):
+            Name of the column that contains text data in the dataset.
+        dataset_kwargs (`dict[str, Any]` or `None`, *optional*, defaults to `None`):
+            Dictionary of optional keyword arguments for the dataset preparation. The only supported key is
+            `skip_prepare_dataset`.
+        dataset_num_proc (`int` or `None`, *optional*, defaults to `None`):
+            Number of processes to use for processing the dataset.
+        eos_token (`str` or `None`, *optional*, defaults to `None`):
+            Token used to indicate the end of a turn or sequence. If `None`, it defaults to
+            `processing_class.eos_token`.
+        pad_token (`str` or `None`, *optional*, defaults to `None`):
+            Token used for padding. If `None`, it defaults to `processing_class.pad_token`, or if that is also
+            `None`, it falls back to `processing_class.eos_token`.
+        max_length (`int` or `None`, *optional*, defaults to `1024`):
+            Maximum length of the tokenized sequence. Sequences longer than `max_length` are truncated from the
+            right. If `None`, no truncation is applied. When packing is enabled, this value sets the sequence
+            length.
+        packing (`bool`, *optional*, defaults to `False`):
+            Whether to pack multiple sequences into a fixed-length format. Uses `max_length` to define sequence
+            length.
+        padding_free (`bool`, *optional*, defaults to `False`):
+            Whether to perform forward passes without padding by flattening all sequences in the batch into a
+            single continuous sequence. This reduces memory usage by eliminating padding overhead.
+        eval_packing (`bool` or `None`, *optional*, defaults to `None`):
+            Whether to pack the eval dataset. If `None`, uses the same value as `packing`.
+        pad_max (`bool`, *optional*, defaults to `True`):
+            Gaudi-specific: whether to pad all sequences to `max_length` during tokenization for static shapes.
+            When enabled, the tokenizer will pad sequences to the maximum length.
+
+        > Parameters that control the training
+
+        learning_rate (`float`, *optional*, defaults to `2e-5`):
+            Initial learning rate for [`AdamW`] optimizer. The default value replaces that of
+            [`~transformers.TrainingArguments`].
+        completion_only_loss (`bool` or `None`, *optional*, defaults to `None`):
+            Whether to compute loss only on the completion part of the sequence. If set to `True`, loss is computed
+            only on the completion, which is supported only for prompt-completion datasets. If `False`, loss is
+            computed on the entire sequence. If `None` (default), the behavior depends on the dataset.
     """
 
-    dataset_text_field: Optional[str] = None
-    packing: Optional[bool] = True
-    max_seq_length: Optional[int] = 1024
-    pad_max: Optional[bool] = True
-    dataset_num_proc: Optional[int] = None
-    dataset_batch_size: int = 1000
-    neftune_noise_alpha: Optional[float] = None
-    model_init_kwargs: Optional[Dict] = None
-    dataset_kwargs: Optional[Dict] = None
-    eval_packing: Optional[bool] = None
-    num_of_sequences: Optional[int] = 1024
-    chars_per_token: Optional[float] = 3.6
+    # Parameters that control the model
+    model_init_kwargs: Optional[dict[str, Any]] = field(
+        default=None,
+        metadata={
+            "help": "Keyword arguments for `AutoModelForCausalLM.from_pretrained`, used when the `model` argument "
+            "of the `GaudiSFTTrainer` is provided as a string."
+        },
+    )
+
+    # Parameters that control the data preprocessing
+    dataset_text_field: str = field(
+        default="text",
+        metadata={"help": "Name of the column that contains text data in the dataset."},
+    )
+    dataset_kwargs: Optional[dict[str, Any]] = field(
+        default=None,
+        metadata={
+            "help": "Dictionary of optional keyword arguments for the dataset preparation. The only supported key "
+            "is `skip_prepare_dataset`."
+        },
+    )
+    dataset_num_proc: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of processes to use for processing the dataset."},
+    )
+    eos_token: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Token used to indicate the end of a turn or sequence. If `None`, it defaults to "
+            "`processing_class.eos_token`."
+        },
+    )
+    pad_token: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Token used for padding. If `None`, it defaults to `processing_class.pad_token`, or if that "
+            "is also `None`, it falls back to `processing_class.eos_token`."
+        },
+    )
+    max_length: Optional[int] = field(
+        default=1024,
+        metadata={
+            "help": "Maximum length of the tokenized sequence. Sequences longer than `max_length` are truncated "
+            "from the right. If `None`, no truncation is applied. When packing is enabled, this value sets the "
+            "sequence length."
+        },
+    )
+    packing: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to pack multiple sequences into a fixed-length format. Uses `max_length` to define "
+            "sequence length."
+        },
+    )
+    padding_free: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to perform forward passes without padding by flattening all sequences in the batch "
+            "into a single continuous sequence."
+        },
+    )
+    eval_packing: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Whether to pack the eval dataset. If `None`, uses the same value as `packing`."},
+    )
+
+    # Gaudi-specific parameters
+    pad_max: Optional[bool] = field(
+        default=True,
+        metadata={
+            "help": "Gaudi-specific: whether to pad all sequences to `max_length` during tokenization for static "
+            "shapes. When enabled, the tokenizer will pad sequences to the maximum length."
+        },
+    )
+
+    # Parameters that control the training
+    learning_rate: float = field(
+        default=2.0e-5,
+        metadata={
+            "help": "Initial learning rate for `AdamW` optimizer. The default value replaces that of "
+            "`TrainingArguments`."
+        },
+    )
+    completion_only_loss: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": "Whether to compute loss only on the completion part of the sequence. If set to `True`, loss "
+            "is computed only on the completion, which is supported only for prompt-completion datasets. If "
+            "`False`, loss is computed on the entire sequence. If `None` (default), the behavior depends on the "
+            "dataset."
+        },
+    )
+
+    # Deprecated parameters
+    dataset_batch_size: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Deprecated. This parameter will be removed in a future version. You can safely remove this "
+            "parameter from your configuration."
+        },
+    )
+    num_of_sequences: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Deprecated. Use `max_length` instead, which specifies the maximum length of the tokenized "
+            "sequence."
+        },
+    )
+    chars_per_token: Optional[float] = field(
+        default=None,
+        metadata={"help": "Deprecated. If you want to customize the packing length, use `max_length`."},
+    )
+    max_seq_length: Optional[int] = field(
+        default=None,
+        metadata={"help": "Deprecated. Use `max_length` instead."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        if self.dataset_batch_size is not None:
+            warnings.warn(
+                "`dataset_batch_size` is deprecated and will be removed in a future version. You can safely remove "
+                "this parameter from your configuration.",
+                DeprecationWarning,
+            )
+
+        if self.num_of_sequences is not None:
+            warnings.warn(
+                "`num_of_sequences` is deprecated and will be removed in a future version. Use `max_length` instead, "
+                "which specifies the maximum length of the tokenized sequence, unlike `num_of_sequences`, which "
+                "referred to string sequences.",
+                DeprecationWarning,
+            )
+
+        if self.chars_per_token is not None:
+            warnings.warn(
+                "`chars_per_token` is deprecated and will be removed in a future version. If you want to customize "
+                "the packing length, use `max_length`.",
+                DeprecationWarning,
+            )
+
+        if self.max_seq_length is not None:
+            warnings.warn(
+                "`max_seq_length` is deprecated and will be removed in a future version. Use `max_length` instead.",
+                DeprecationWarning,
+            )
+            if self.max_length is None:
+                self.max_length = self.max_seq_length
